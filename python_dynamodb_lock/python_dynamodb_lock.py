@@ -4,7 +4,7 @@
 """
 module comment
 """
-import botocore
+from botocore.exceptions import ClientError
 import datetime
 import socket
 import time
@@ -107,7 +107,7 @@ class DynamoDBLockClient:
                 # attribute_exists(#pk) AND attribute_exists(#sk) AND #rvn = :rvn AND #on = :on
                 # attribute-names
                 # attribute-values
-            except botocore.exceptions.ClientError as e:
+            except ClientError as e:
                 if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
                     # TODO: need to handle the case where the lock was "stolen" by someone else...
                     print
@@ -155,7 +155,7 @@ class DynamoDBLockClient:
                 # attribute_exists(#pk) AND attribute_exists(#sk) AND #rvn = :rvn AND #on = :on
                 # attribute-names
                 # attribute-values
-            except botocore.exceptions.ClientError as e:
+            except ClientError as e:
                 if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
                     # TODO: need to handle the case where the lock was "stolen" by someone else...
                     print
