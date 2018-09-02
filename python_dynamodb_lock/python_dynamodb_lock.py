@@ -65,7 +65,7 @@ class DynamoDBLockClient:
         Creates and starts a daemon thread - that calls DynamoDBLockClient.run() method.
         """
         background_thread = threading.Thread(
-            name='DynamoDBLockClient-' + uuid,
+            name='DynamoDBLockClient-' + self.uuid,
             target=self
         )
         background_thread.daemon = True
@@ -80,7 +80,7 @@ class DynamoDBLockClient:
             if self.shutting_down: return None
 
             start_time = datetime.datetime.utcnow()
-            for lock in self.locks.itervalues():
+            for id, lock in self.locks.items():
                 self.send_heartbeat(lock)
             end_time = datetime.datetime.utcnow()
 
@@ -99,7 +99,7 @@ class DynamoDBLockClient:
         with lock.lock:
             try:
                 # TODO actual impl
-                print
+                print()
                 # update
                 # table
                 # keys
@@ -110,11 +110,11 @@ class DynamoDBLockClient:
             except ClientError as e:
                 if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
                     # TODO: need to handle the case where the lock was "stolen" by someone else...
-                    print
+                    print()
                 else:
-                    print
+                    print()
             except:
-                print
+                print()
 
 
     def close(self):
@@ -158,18 +158,18 @@ class DynamoDBLockClient:
             except ClientError as e:
                 if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
                     # TODO: need to handle the case where the lock was "stolen" by someone else...
-                    print
+                    print()
                 else:
                     # if not best_effort: raise error
-                    print
+                    print()
             except:
-                print
+                print()
 
 
     # TODO: make this private?
     def release_all_locks(self):
         """"""
-        for lock in self.locks.itervalues():
+        for id, lock in self.locks.items():
             self.release_lock(lock)
 
     # get_lock
