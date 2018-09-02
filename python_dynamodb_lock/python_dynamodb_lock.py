@@ -4,7 +4,6 @@
 """
 module comment
 """
-import boto3
 import botocore
 import datetime
 import socket
