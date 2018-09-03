@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-"""Top-level package for Python DynamoDB Lock."""
+"""The package contains a single module - with the same name i.e. python_dynamodb_lock"""
 
 __author__ = """Mohan Kishore"""
 __email__ = 'mohankishore@yahoo.com'

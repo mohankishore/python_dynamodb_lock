@@ -8,7 +8,7 @@ Welcome to Python DynamoDB Lock's documentation!
    readme
    installation
    usage
-   modules
+   python_dynamodb_lock
    contributing
    authors
    history
