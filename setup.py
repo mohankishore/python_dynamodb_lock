@@ -13,7 +13,8 @@ with open('HISTORY.rst') as history_file:
 
 requirements = [
     'boto3',
-    'botocore'
+    'botocore',
+    'futures'
 ]
 
 setup_requirements = [ ]
