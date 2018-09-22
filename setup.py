@@ -14,7 +14,6 @@ with open('HISTORY.rst') as history_file:
 requirements = [
     'boto3',
     'botocore',
-    'futures'
 ]
 
 setup_requirements = [ ]
@@ -29,8 +28,6 @@ setup(
         'Intended Audience :: Developers',
         'License :: OSI Approved :: Apache Software License',
         'Natural Language :: English',
-        "Programming Language :: Python :: 2",
-        'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.4',
         'Programming Language :: Python :: 3.5',
