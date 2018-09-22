@@ -13,7 +13,7 @@ import logging
 import socket
 import time
 import threading
-import urllib
+from urllib.parse import quote
 import uuid
 
 # module level logger
@@ -71,8 +71,9 @@ class DynamoDBLockClient:
         :param int heartbeat_tps: The number of heartbeats to execute per second (per node) - this
                 will have direct correlation to DynamoDB provisioned throughput for writes. Defaults to 
                 5 per second.
-        :param ThreadPoolExecutor : The executor to be used for invoking the app_callbacks in case of
-                un-expected errors. Defaults to a ThreadPoolExecutor with maximum of 5 threads. 
+        :param ThreadPoolExecutor app_callback_executor: The executor to be used for invoking the
+                app_callbacks in case of un-expected errors. Defaults to a ThreadPoolExecutor with a
+                maximum of 5 threads.
         """
         self.uuid = uuid.uuid4()
         self.dynamodb_client = dynamodb_client
@@ -116,7 +117,7 @@ class DynamoDBLockClient:
         """
         # A more useful local representation of the heartbeat_tps field
         # e.g. 5 TPS => a max of 1 loop every 200ms
-        min_loop_time = 1.0 / self.heartbeat_tps
+        min_loop_time = datetime.timedelta(microseconds=(10**6 / self.heartbeat_tps))
 
         while not self._shutting_down:
             logger.info('Starting a heartbeat loop')
@@ -127,14 +128,14 @@ class DynamoDBLockClient:
                 count += 1
                 self._send_heartbeat(lock)
                 # After each lock, sleep a little (if needed) to honor the heartbeat_tps
-                elapsed_time = (datetime.datetime.utcnow() - start_time).total_seconds()
+                elapsed_time = datetime.datetime.utcnow() - start_time
                 if elapsed_time < min_loop_time * count:
-                    time.sleep(min_loop_time * count - elapsed_time)
+                    time.sleep( (min_loop_time * count - elapsed_time).total_seconds() )
 
             # After all the locks have been "heartbeat"-ed, sleep before the next run (if needed)
-            elapsed_time = (datetime.datetime.utcnow() - start_time)
+            elapsed_time = datetime.datetime.utcnow() - start_time
             if elapsed_time < self.heartbeat_period and not self._shutting_down:
-                time.sleep((self.heartbeat_period - elapsed_time).total_seconds())
+                time.sleep( (self.heartbeat_period - elapsed_time).total_seconds() )
 
 
     def _send_heartbeat(self, lock):
@@ -152,7 +153,7 @@ class DynamoDBLockClient:
         with lock.thread_lock:
             try:
                 # the ddb-lock might have been released while waiting for the thread-lock
-                if not self._locks.has_key(lock.unique_identifier): return
+                if lock.unique_identifier not in self._locks: return
 
                 old_record_version_number = lock.record_version_number
                 new_record_version_number = str(uuid.uuid4())
@@ -199,7 +200,7 @@ class DynamoDBLockClient:
                 logger.warning('Unexpected error while sending heartbeat: %s', lock.unique_identifier, exc_info=True)
             finally:
                 # Note: the lock might have been released locally by the conditional-exception above
-                if not self._locks.has_key(lock.unique_identifier): return
+                if lock.unique_identifier not in self._locks: return
                 # if the lock is in danger, invoke the app-callback
                 last_update_time = lock.expiry_time - self.expiry_period.total_seconds()
                 is_lock_safe = time.time() < (last_update_time + self.safe_period.total_seconds())
@@ -330,7 +331,7 @@ class DynamoDBLockClient:
                 # if this client did not create the lock being released
                 if lock.unique_identifier not in self._locks:
                     if best_effort:
-                        logger.warn('Lock not owned by this client: %s', str(lock))
+                        logger.warning('Lock not owned by this client: %s', str(lock))
                     else:
                         raise DynamoDBLockError(DynamoDBLockError.LOCK_NOT_OWNED, 'Lock is not owned by this client')
 
@@ -359,15 +360,15 @@ class DynamoDBLockClient:
                 logger.info('Successfully released the lock: %s', lock.unique_identifier)
             except ClientError as e:
                 if best_effort:
-                    logger.warn('Lock was stolen by someone else: %s', lock.unique_identifier)
+                    logger.warning('Lock was stolen by someone else: %s', lock.unique_identifier)
                 elif e.response['Error']['Code'] == 'ConditionalCheckFailedException':
                     # Note: this is slightly different from the Java impl - which would just returns false
                     raise DynamoDBLockError(DynamoDBLockError.LOCK_STOLEN, 'Lock was stolen by someone else')
                 else:
                     raise DynamoDBLockError(DynamoDBLockError.UNKNOWN, str(e))
             except Exception as e:
-                if (best_effort):
-                    logger.warn('Unknown error while releasing lock: %s, %s', lock.unique_identifier, str(e))
+                if best_effort:
+                    logger.warning('Unknown error while releasing lock: %s', lock.unique_identifier, exc_info=True)
                 else:
                     raise DynamoDBLockError(DynamoDBLockError.UNKNOWN, str(e))
 
@@ -541,7 +542,7 @@ class BaseDynamoDBLock:
         self.expiry_time = expiry_time
         self.additional_attributes = additional_attributes
         # additional properties
-        self.unique_identifier = urllib.quote(partition_key) + '|' + urllib.quote(sort_key)
+        self.unique_identifier = quote(partition_key) + '|' + quote(sort_key)
         self.lease_duration = datetime.timedelta(seconds=lease_duration_in_seconds)
 
 
