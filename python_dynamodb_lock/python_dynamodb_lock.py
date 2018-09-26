@@ -4,6 +4,24 @@
 This is a general purpose distributed locking library built on top of DynamoDB. It is heavily
 "inspired" by the java-based AmazonDynamoDBLockClient library, and supports both coarse-grained
 and fine-grained locking.
+
+Note that while the lock itself can offer fairly strong consistency guarantees, it does NOT
+participate in any kind of distributed transaction.
+
+For example, you may wish to acquire a lock for some customer-id "xyz", and then make some changes
+to the corresponding database entry for this customer-id, and then release the lock - thereby
+guaranteeing that only one process changes any given customer-id at a time.
+
+While the happy path looks okay, consider a case where the application changes take a long time,
+and some errors/gc-pauses prevent the heartbeat from updating the lock. Then, some other client
+can assume the lock to be abandoned, and start processing the same customer in parallel. The original
+lock-client will recognize that its lock has been "stolen" and will let the app know through a callback
+event, but the app may have already committed its changes to the database. This can only be solved by
+having the application changes and the lock-release be part of a single distributed transaction - which,
+as indicated earlier, is NOT supported.
+
+That said, in most cases, where the heartbeat is not expected to get delayed beyond the lock's lease
+duration, the implementation should work just fine.
 """
 
 from botocore.exceptions import ClientError
@@ -23,21 +41,6 @@ logger = logging.getLogger(__name__)
 class DynamoDBLockClient:
     """
     Provides distributed locks using DynamoDB's support for conditional reads/writes.
-
-    Note that while the lock itself can offer fairly strong consistency guarantees, it does NOT
-    participate in any kind of distributed transaction. For example, you may wish to acquire a lock
-    for some customer-id "xyz", and then make some changes to the corresponding database entry for this
-    customer-id, and then release the lock - thereby guaranteeing that only one process changes any
-    given customer-id at a time. While the happy path looks okay, consider a case where the application
-    changes take a long time, and some errors/gc-pauses prevent the heartbeat from updating the lock -
-    then, some other client can assume the lock to be abandoned, and start processing the same customer
-    in parallel. The original lock-client will recognize that its lock has been "stolen" and will let
-    the app know through a callback event, but the app may have already commited its changes to the
-    database. This can only be solved by having the application changes and the lock-release be part
-    of a single distributed transaction - which, as indicated earlier, is NOT supported.
-
-    That said, in most cases, where the heartbeat is not expected to get delayed beyond the lock's lease
-    duration, the implementation should work just fine.
     """
 
     # default values for class properties
@@ -134,7 +137,7 @@ class DynamoDBLockClient:
         Keeps renewing the leases for the locks owned by this client - till the client is closed.
 
         The method has a while loop that wakes up on a periodic basis (as defined by the heartbeat_period)
-        and invokes the _send_heartbeat() method on each lock.
+        and invokes the send_heartbeat() method on each lock.
         """
         # e.g. 5 TPS => each loop should take an average of 0.2 seconds (200ms)
         avg_loop_time = 1.0 / self.heartbeat_tps
@@ -146,7 +149,7 @@ class DynamoDBLockClient:
 
             for uid, lock in self._locks.copy().items():
                 count += 1
-                self._send_heartbeat(lock)
+                self.send_heartbeat(lock)
                 # After each lock, sleep a little (if needed) to honor the heartbeat_tps
                 curr_loop_end_time = time.time()
                 next_loop_start_time = start_time + count * avg_loop_time
@@ -161,7 +164,7 @@ class DynamoDBLockClient:
                 time.sleep( next_start_time - end_time )
 
 
-    def _send_heartbeat(self, lock):
+    def send_heartbeat(self, lock):
         """
         Renews the lease for the given lock.
 
@@ -174,12 +177,14 @@ class DynamoDBLockClient:
         (lock requestor) app know when there are significant events in the lock lifecycle. There
         are two such events:
 
-        1) LOCK_STOLEN: When the heartbeat process finds that someone else has taken over the lock,
+        1) LOCK_STOLEN
+            When the heartbeat process finds that someone else has taken over the lock,
             or it has been released/deleted without the lock-client's knowledge. In this case, the
             app_callback should just try to abort its processing and roll back any changes it had
             made with the assumption that it owned the lock. This is not a normal occurrance and
             should only happen if someone manually changes/deletes the data in DynamoDB.
-        2) LOCK_IN_DANGER: When the heartbeat for a given lock has failed multiple times, and it is
+        2) LOCK_IN_DANGER
+            When the heartbeat for a given lock has failed multiple times, and it is
             now in danger of going past its lease-duration without a successful heartbeat - at which
             point, any other client waiting to acquire the lock will consider it abandoned and take
             over. In this case, the app_callback should try to expedite the processing,  either
@@ -270,21 +275,24 @@ class DynamoDBLockClient:
         If the lock is currently held by a different client, then this client will keep retrying on
         a periodic basis. In that case, a few different things can happen:
 
-        1) The other client releases the lock, which would basically delete it from the database -
-            allowing this client to try and insert its own record instead.
-        2) The other client dies, and the lock stops getting updated by the heartbeat thread. While
-            waiting for a lock, this client keeps track of the local-time whenever it sees the lock's
+        1) The other client releases the lock - basically deleting it from the database
+            Which would allow this client to try and insert its own record instead.
+        2) The other client dies, and the lock stops getting updated by the heartbeat thread.
+            While waiting for a lock, this client keeps track of the local-time whenever it sees the lock's
             record-version-number change. From that point-in-time, it needs to wait for a period of time
             equal to the lock's lease duration before concluding that the lock has been abandoned and try
             to overwrite the database entry with its own lock.
-        3) While waiting for the other client to release the lock (or for the lock's lease to expire), this
-            client may go over the max-retry-period (i.e. the retry_timeout) allowed by the caller - in
-            which case, a DynamoDBLockError with code == ACQUIRE_TIMEOUT will be thrown.
-        4) Whenever the "old" lock is released (or expires), there may be multiple "new" clients trying
+        3) This client goes over the max-retry-timeout-period
+            While waiting for the other client to release the lock (or for the lock's lease to expire), this
+            client may go over the retry_timeout period (as provided by the caller) - in which case, a
+            DynamoDBLockError with code == ACQUIRE_TIMEOUT will be thrown.
+        4) Race-condition amongst multiple lock-clients waiting to acquire lock
+            Whenever the "old" lock is released (or expires), there may be multiple "new" clients trying
             to grab the lock - in which case, one of those would succeed, and the rest of them would get
             a "conditional-update-exception". This is just logged and swallowed internally - and the
             client moves on to another sleep-retry cycle.
-        5) Any other error/exception - wrapped inside a DynamoDBLockError and raised to the caller.
+        5) Any other error/exception
+            Would be wrapped inside a DynamoDBLockError and raised to the caller.
 
         :param str partition_key: The primary lock identifier
         :param str sort_key: Forms a "composite identifier" along with the partition_key. Defaults to '-'
