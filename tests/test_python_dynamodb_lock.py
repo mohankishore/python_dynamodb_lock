@@ -104,7 +104,7 @@ class TestDynamoDBLockClient(unittest.TestCase):
         self.ddb_table.update_item.side_effect = RuntimeError('TestError')
         self.lock_client.acquire_lock('key', app_callback=self.app_callback)
         time.sleep(600/1000)
-        self.assertEqual(len(self.app_callbacks), 1)
+        self.assertTrue(len(self.app_callbacks) >= 1)
         (code, lock) = self.app_callbacks.pop(0)
         self.assertEqual(code, DynamoDBLockError.LOCK_IN_DANGER)
 
