@@ -23,22 +23,39 @@ logger = logging.getLogger(__name__)
 class DynamoDBLockClient:
     """
     Provides distributed locks using DynamoDB's support for conditional reads/writes.
+
+    Note that while the lock itself can offer fairly strong consistency guarantees, it does NOT
+    participate in any kind of distributed transaction. For example, you may wish to acquire a lock
+    for some customer-id "xyz", and then make some changes to the corresponding database entry for this
+    customer-id, and then release the lock - thereby guaranteeing that only one process changes any
+    given customer-id at a time. While the happy path looks okay, consider a case where the application
+    changes take a long time, and some errors/gc-pauses prevent the heartbeat from updating the lock -
+    then, some other client can assume the lock to be abandoned, and start processing the same customer
+    in parallel. The original lock-client will recognize that its lock has been "stolen" and will let
+    the app know through a callback event, but the app may have already commited its changes to the
+    database. This can only be solved by having the application changes and the lock-release be part
+    of a single distributed transaction - which, as indicated earlier, is NOT supported.
+
+    That said, in most cases, where the heartbeat is not expected to get delayed beyond the lock's lease
+    duration, the implementation should work just fine.
     """
 
     # default values for class properties
-    _DEFAULT_TABLE_NAME = 'lockTable'
-    _DEFAULT_PARTITION_KEY_NAME = 'key'
+    _DEFAULT_TABLE_NAME = 'DynamoDBLockTable'
+    _DEFAULT_PARTITION_KEY_NAME = 'lock_key'
     _DEFAULT_SORT_KEY_NAME = 'sort_key'
     _DEFAULT_HEARTBEAT_PERIOD = datetime.timedelta(seconds=5)
     _DEFAULT_SAFE_PERIOD = datetime.timedelta(seconds=20)
     _DEFAULT_LEASE_DURATION = datetime.timedelta(seconds=30)
     _DEFAULT_EXPIRY_PERIOD = datetime.timedelta(hours=1)
     _DEFAULT_HEARTBEAT_TPS = 5
-    _DEFAULT_APP_CALLBACK_EXECUTOR = ThreadPoolExecutor(max_workers=5, thread_name_prefix='DynamoDBLockClient-CB-')
+    _DEFAULT_APP_CALLBACK_THREADPOOL_SIZE = 5
+
+    _DEFAULT_SORT_KEY_VALUE = '-'
 
 
     def __init__(self,
-                 dynamodb_client,
+                 dynamodb,
                  table_name=_DEFAULT_TABLE_NAME,
                  partition_key_name=_DEFAULT_PARTITION_KEY_NAME,
                  sort_key_name=_DEFAULT_SORT_KEY_NAME,
@@ -48,12 +65,12 @@ class DynamoDBLockClient:
                  lease_duration=_DEFAULT_LEASE_DURATION,
                  expiry_period=_DEFAULT_EXPIRY_PERIOD,
                  heartbeat_tps=_DEFAULT_HEARTBEAT_TPS,
-                 app_callback_executor=_DEFAULT_APP_CALLBACK_EXECUTOR
+                 app_callback_executor=None
                  ):
         """
-        :param boto3.DynamoDB.Client dynamodb_client: mandatory argument
-        :param str table_name: defaults to 'lockTable'
-        :param str partition_key_name: defaults to 'key'
+        :param boto3.ServiceResource dynamodb: mandatory argument
+        :param str table_name: defaults to 'DynamoDBLockTable'
+        :param str partition_key_name: defaults to 'lock_key'
         :param str sort_key_name: defaults to 'sort_key'
         :param str owner_name: defaults to hostname + uuid
         :param datetime.timedelta heartbeat_period: How often to update DynamoDB to note that the
@@ -69,27 +86,31 @@ class DynamoDBLockClient:
                 than the lease_duration to ensure that clock-skew etc. are not an issue. Defaults
                 to 1 hour.
         :param int heartbeat_tps: The number of heartbeats to execute per second (per node) - this
-                will have direct correlation to DynamoDB provisioned throughput for writes. Defaults to 
+                will have direct correlation to DynamoDB provisioned throughput for writes. Defaults to
                 5 per second.
         :param ThreadPoolExecutor app_callback_executor: The executor to be used for invoking the
                 app_callbacks in case of un-expected errors. Defaults to a ThreadPoolExecutor with a
                 maximum of 5 threads.
         """
-        self.uuid = uuid.uuid4()
-        self.dynamodb_client = dynamodb_client
+        self.uuid = uuid.uuid4().hex
+        self.dynamodb = dynamodb
         self.table_name = table_name
         self.partition_key_name = partition_key_name
         self.sort_key_name = sort_key_name
-        self.owner_name = owner_name if owner_name else socket.getfqdn() + self.uuid
+        self.owner_name = owner_name or (socket.getfqdn() + self.uuid)
         self.heartbeat_period = heartbeat_period
         self.safe_period = safe_period
         self.lease_duration = lease_duration
         self.expiry_period = expiry_period
         self.heartbeat_tps = heartbeat_tps
-        self.app_callback_executor = app_callback_executor
+        self.app_callback_executor = app_callback_executor or ThreadPoolExecutor(
+            max_workers=self._DEFAULT_APP_CALLBACK_THREADPOOL_SIZE,
+            thread_name_prefix='DynamoDBLockClient-CB-' + self.uuid + "-"
+        )
         # additional properties
         self._locks = {}
         self._shutting_down = False
+        self.dynamodb_table = dynamodb.Table(table_name)
         # and, initialization
         self._start_background_thread()
         logger.info('Created: %s', str(self))
@@ -101,7 +122,7 @@ class DynamoDBLockClient:
         """
         self._background_thread = threading.Thread(
             name='DynamoDBLockClient-HB-' + self.uuid,
-            target=self
+            target=self.run
         )
         self._background_thread.daemon = True
         self._background_thread.start()
@@ -115,27 +136,29 @@ class DynamoDBLockClient:
         The method has a while loop that wakes up on a periodic basis (as defined by the heartbeat_period)
         and invokes the _send_heartbeat() method on each lock.
         """
-        # A more useful local representation of the heartbeat_tps field
-        # e.g. 5 TPS => a max of 1 loop every 200ms
-        min_loop_time = datetime.timedelta(microseconds=(10**6 / self.heartbeat_tps))
+        # e.g. 5 TPS => each loop should take an average of 0.2 seconds (200ms)
+        avg_loop_time = 1.0 / self.heartbeat_tps
 
         while not self._shutting_down:
             logger.info('Starting a heartbeat loop')
-            start_time = datetime.datetime.utcnow()
+            start_time = time.time()
             count = 0
 
-            for uid, lock in self._locks.items():
+            for uid, lock in self._locks.copy().items():
                 count += 1
                 self._send_heartbeat(lock)
                 # After each lock, sleep a little (if needed) to honor the heartbeat_tps
-                elapsed_time = datetime.datetime.utcnow() - start_time
-                if elapsed_time < min_loop_time * count:
-                    time.sleep( (min_loop_time * count - elapsed_time).total_seconds() )
+                curr_loop_end_time = time.time()
+                next_loop_start_time = start_time + count * avg_loop_time
+                if curr_loop_end_time < next_loop_start_time:
+                    time.sleep( next_loop_start_time - curr_loop_end_time )
 
             # After all the locks have been "heartbeat"-ed, sleep before the next run (if needed)
-            elapsed_time = datetime.datetime.utcnow() - start_time
-            if elapsed_time < self.heartbeat_period and not self._shutting_down:
-                time.sleep( (self.heartbeat_period - elapsed_time).total_seconds() )
+            logger.info('Finished the heartbeat loop')
+            end_time = time.time()
+            next_start_time = start_time + self.heartbeat_period.total_seconds()
+            if end_time < next_start_time and not self._shutting_down:
+                time.sleep( next_start_time - end_time )
 
 
     def _send_heartbeat(self, lock):
@@ -145,7 +168,22 @@ class DynamoDBLockClient:
         It actually just switches the record_version_number on the existing lock - which tells
         all other clients waiting for this lock that the current owner is still alive, and they
         effectively reset their timers (to wait for lease_duration from the time they see this
-        new record_version_number)
+        new record_version_number).
+
+        As this method is called on a background thread, it uses the app_callback to let the
+        (lock requestor) app know when there are significant events in the lock lifecycle. There
+        are two such events:
+
+        1) LOCK_STOLEN: When the heartbeat process finds that someone else has taken over the lock,
+            or it has been released/deleted without the lock-client's knowledge. In this case, the
+            app_callback should just try to abort its processing and roll back any changes it had
+            made with the assumption that it owned the lock. This is not a normal occurrance and
+            should only happen if someone manually changes/deletes the data in DynamoDB.
+        2) LOCK_IN_DANGER: When the heartbeat for a given lock has failed multiple times, and it is
+            now in danger of going past its lease-duration without a successful heartbeat - at which
+            point, any other client waiting to acquire the lock will consider it abandoned and take
+            over. In this case, the app_callback should try to expedite the processing,  either
+            commit or rollback its changes quickly, and release the lock.
 
         :param DynamoDBLock lock: the lock instance that needs its lease to be renewed
         """
@@ -157,16 +195,13 @@ class DynamoDBLockClient:
 
                 old_record_version_number = lock.record_version_number
                 new_record_version_number = str(uuid.uuid4())
-                # for expiry related calculations, we use the time module (better epoch-seconds support)
-                # for everything else, we use the datetime module (better period/timedelta support)
                 new_expiry_time = time.time() + self.expiry_period.total_seconds()
 
                 # first, try to update the database
-                self.dynamodb_client.update_item(
-                    TableName=self.table_name,
+                self.dynamodb_table.update_item(
                     Key={
-                        self.partition_key_name: {'S': lock.partition_key},
-                        self.sort_key_name: {'S': lock.sort_key}
+                        self.partition_key_name: lock.partition_key,
+                        self.sort_key_name: lock.sort_key
                     },
                     UpdateExpression='SET #rvn = :new_rvn, #et = :new_et',
                     ConditionExpression='attribute_exists(#pk) AND attribute_exists(#sk) AND #rvn = :old_rvn',
@@ -186,17 +221,18 @@ class DynamoDBLockClient:
                 # if successful, update the in-memory lock representations
                 lock.record_version_number = new_record_version_number
                 lock.expiry_time = new_expiry_time
+                logger.debug('Successfully sent the heartbeat: %s', lock.unique_identifier)
             except ClientError as e:
                 if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
                     # someone else stole our lock!
-                    logger.warning('LockNotOwnerError while sending heartbeat: %s', lock.unique_identifier)
+                    logger.warning('LockStolenError while sending heartbeat: %s', lock.unique_identifier)
                     # let's drop it from our in-memory collection as well
                     del self._locks[lock.unique_identifier]
                     # callback - the app should abort its processing; no need to release
                     self._call_app_callback(lock, DynamoDBLockError.LOCK_STOLEN)
                 else:
                     logger.warning('ClientError while sending heartbeat: %s', lock.unique_identifier, exc_info=True)
-            except:
+            except Exception as e:
                 logger.warning('Unexpected error while sending heartbeat: %s', lock.unique_identifier, exc_info=True)
             finally:
                 # Note: the lock might have been released locally by the conditional-exception above
@@ -205,7 +241,7 @@ class DynamoDBLockClient:
                 last_update_time = lock.expiry_time - self.expiry_period.total_seconds()
                 is_lock_safe = time.time() < (last_update_time + self.safe_period.total_seconds())
                 if not is_lock_safe:
-                    logger.warning('LockNotSafe while sending heartbeat: %s', lock.unique_identifier)
+                    logger.warning('LockInDanger while sending heartbeat: %s', lock.unique_identifier)
                     # callback - the app should abort its processing, and release the lock
                     self._call_app_callback(lock, DynamoDBLockError.LOCK_IN_DANGER)
 
@@ -213,34 +249,53 @@ class DynamoDBLockClient:
     def _call_app_callback(self, lock, code):
         """
         Utility function to route the app_callback through the thread-pool-executor
-        
+
         :param DynamoDBLock lock: the lock for which the event is being fired
-        :param str code: the notification event-type 
+        :param str code: the notification event-type
         """
         self.app_callback_executor.submit(lock.app_callback, code, lock)
 
 
     def acquire_lock(self,
                      partition_key,
-                     sort_key=None,
+                     sort_key=_DEFAULT_SORT_KEY_VALUE,
                      retry_period=datetime.timedelta(seconds=2),
                      retry_timeout=datetime.timedelta(seconds=5),
-                     additional_attributes={},
+                     additional_attributes=None,
                      app_callback=None,
                      ):
         """
         Acquires a distributed DynaomDBLock for the given key(s).
 
+        If the lock is currently held by a different client, then this client will keep retrying on
+        a periodic basis. In that case, a few different things can happen:
+
+        1) The other client releases the lock, which would basically delete it from the database -
+            allowing this client to try and insert its own record instead.
+        2) The other client dies, and the lock stops getting updated by the heartbeat thread. While
+            waiting for a lock, this client keeps track of the local-time whenever it sees the lock's
+            record-version-number change. From that point-in-time, it needs to wait for a period of time
+            equal to the lock's lease duration before concluding that the lock has been abandoned and try
+            to overwrite the database entry with its own lock.
+        3) While waiting for the other client to release the lock (or for the lock's lease to expire), this
+            client may go over the max-retry-period (i.e. the retry_timeout) allowed by the caller - in
+            which case, a DynamoDBLockError with code == ACQUIRE_TIMEOUT will be thrown.
+        4) Whenever the "old" lock is released (or expires), there may be multiple "new" clients trying
+            to grab the lock - in which case, one of those would succeed, and the rest of them would get
+            a "conditional-update-exception". This is just logged and swallowed internally - and the
+            client moves on to another sleep-retry cycle.
+        5) Any other error/exception - wrapped inside a DynamoDBLockError and raised to the caller.
+
         :param str partition_key: The primary lock identifier
-        :param str sort_key: If present, forms a "composite identifier" along with the partition_key
+        :param str sort_key: Forms a "composite identifier" along with the partition_key. Defaults to '-'
         :param datetime.timedelta retry_period: If the lock is not immediately available, how long
                 should we wait between retries? Defaults to 2 seconds.
         :param datetime.timedelta retry_timeout: If the lock is not available for an extended period,
                 how long should we keep trying before giving up and timing out? Defaults to 5 seconds.
         :param dict additional_attributes: Arbitrary application metadata to be stored with the lock
-        :param Callable app_callback: Callback function that can be used to notify the app of lock entering 
+        :param Callable app_callback: Callback function that can be used to notify the app of lock entering
                 the danger period, or an unexpected release
-        :rtype: BaseDynamoDBLock
+        :rtype: DynamoDBLock
         :return: A distributed lock instance
         """
         logger.info('Trying to acquire lock for: %s, %s', partition_key, sort_key)
@@ -256,16 +311,18 @@ class DynamoDBLockClient:
             lock_client=self,
         )
 
-        retry_timeout_time = datetime.datetime.utcnow() + retry_timeout
+        start_time = time.time()
+        retry_timeout_time = start_time + retry_timeout.total_seconds()
+        retry_count = 0
         last_record_version_number = None
-        last_version_fetch_time = None
+        last_version_fetch_time = -1.0
         while True:
             if self._shutting_down:
                 raise DynamoDBLockError(DynamoDBLockError.CLIENT_SHUTDOWN, 'Client already shut down')
 
             try:
                 # need to bump up the expiry time - to account for the sleep between tries
-                new_lock.expiry_time = time.time() + self.expiry_period.total_seconds(),
+                new_lock.expiry_time = time.time() + self.expiry_period.total_seconds()
 
                 logger.debug('Checking the database for existing owner: %s', new_lock.unique_identifier)
                 existing_lock = self._get_lock_from_dynamodb(partition_key, sort_key)
@@ -286,15 +343,15 @@ class DynamoDBLockClient:
                         # if the record_version_number changes, the lock gets a fresh lease of life
                         # keep track of the time we first saw this record_version_number
                         last_record_version_number = existing_lock.record_version_number
-                        last_version_fetch_time = datetime.datetime.utcnow()
+                        last_version_fetch_time = time.time()
                     else:
                         logger.debug('Existing lock\'s record_version_number has not changed: %s, %s',
                                      new_lock.unique_identifier,
                                      last_record_version_number)
                         # if the record_version_number has not changed for more than lease_duration period,
                         # it basically means that the owner thread/process has died.
-                        last_version_elapsed_time = datetime.datetime.utcnow() - last_version_fetch_time
-                        if last_version_elapsed_time > existing_lock.lease_duration:
+                        last_version_elapsed_time = time.time() - last_version_fetch_time
+                        if last_version_elapsed_time > existing_lock.lease_duration.total_seconds():
                             logger.warning('Existing lock\'s lease has expired: %s', str(existing_lock))
                             self._overwrite_existing_lock_in_dynamodb(new_lock, last_record_version_number)
                             logger.debug('Added to the DDB. Adding to in-memory map: %s', new_lock.unique_identifier)
@@ -303,22 +360,32 @@ class DynamoDBLockClient:
                             return new_lock
             except ClientError as e:
                 if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
-                    logger.info('Someone else beat us to it - just log-it, sleep and retry')
+                    logger.info('Someone else beat us to it - just log-it, sleep and retry: %s', new_lock.unique_identifier)
                 else:
                     raise DynamoDBLockError(DynamoDBLockError.UNKNOWN, str(e))
             except Exception as e:
                 raise DynamoDBLockError(DynamoDBLockError.UNKNOWN, str(e))
 
             # sleep and retry
-            if datetime.datetime.utcnow() + retry_period < retry_timeout_time:
-                time.sleep(retry_period.total_seconds())
-            else:
-                raise DynamoDBLockError(DynamoDBLockError.ACQUIRE_TIMEOUT, 'acquire_lock() timed out')
+            retry_count += 1
+            curr_loop_end_time = time.time()
+            next_loop_start_time = start_time + retry_count * retry_period.total_seconds()
+            if next_loop_start_time > retry_timeout_time:
+                raise DynamoDBLockError(DynamoDBLockError.ACQUIRE_TIMEOUT, 'acquire_lock() timed out: ' + new_lock.unique_identifier)
+            elif curr_loop_end_time < next_loop_start_time:
+                logger.info('Sleeping before a retry: %s', new_lock.unique_identifier)
+                time.sleep(next_loop_start_time - curr_loop_end_time)
 
 
     def release_lock(self, lock, best_effort=True):
         """
         Releases the given lock - by deleting it from the database.
+
+        It allows the caller app to indicate whether it wishes to be informed of all errors/exceptions,
+        or just have the lock-client swallow all of them. A typical usage pattern would include acquiring
+        the lock, making app changes, and releasing the lock. By the time the app is releasing the lock,
+        it would generally be too late to respond to any errors encountered during the release phase - but,
+        the app may still wish to get informed and log it somewhere of offline re-conciliation/follow-up.
 
         :param DynamoDBLock lock: The lock instance that needs to be released
         :param bool best_effort: If True, any exception when calling DynamoDB will be ignored
@@ -326,25 +393,26 @@ class DynamoDBLockClient:
                 be updated / deleted but will eventually expire. Defaults to True.
         """
         logger.info('Releasing the lock: %s', str(lock))
+
+        # if this client did not create the lock being released
+        if lock.unique_identifier not in self._locks:
+            if best_effort:
+                logger.warning('Lock not owned by this client: %s', str(lock))
+                return
+            else:
+                raise DynamoDBLockError(DynamoDBLockError.LOCK_NOT_OWNED, 'Lock is not owned by this client')
+
         with lock.thread_lock:
             try:
-                # if this client did not create the lock being released
-                if lock.unique_identifier not in self._locks:
-                    if best_effort:
-                        logger.warning('Lock not owned by this client: %s', str(lock))
-                    else:
-                        raise DynamoDBLockError(DynamoDBLockError.LOCK_NOT_OWNED, 'Lock is not owned by this client')
-
                 # first, remove from in-memory locks - will stop the heartbeats
                 # even if the database call fails, it will auto-release after the lease expires
                 del self._locks[lock.unique_identifier]
 
                 # then, remove it from the database
-                self.dynamodb_client.delete_item(
-                    TableName=self.table_name,
+                self.dynamodb_table.delete_item(
                     Key={
-                        self.partition_key_name: {'S': lock.partition_key},
-                        self.sort_key_name: {'S': lock.sort_key}
+                        self.partition_key_name: lock.partition_key,
+                        self.sort_key_name: lock.sort_key
                     },
                     ConditionExpression='attribute_exists(#pk) AND attribute_exists(#sk) AND #rvn = :rvn',
                     ExpressionAttributeNames={
@@ -360,7 +428,7 @@ class DynamoDBLockClient:
                 logger.info('Successfully released the lock: %s', lock.unique_identifier)
             except ClientError as e:
                 if best_effort:
-                    logger.warning('Lock was stolen by someone else: %s', lock.unique_identifier)
+                    logger.warning('DynamoDb error while releasing lock: %s', lock.unique_identifier, exc_info=True)
                 elif e.response['Error']['Code'] == 'ConditionalCheckFailedException':
                     # Note: this is slightly different from the Java impl - which would just returns false
                     raise DynamoDBLockError(DynamoDBLockError.LOCK_STOLEN, 'Lock was stolen by someone else')
@@ -373,18 +441,17 @@ class DynamoDBLockClient:
                     raise DynamoDBLockError(DynamoDBLockError.UNKNOWN, str(e))
 
 
-    def _get_lock_from_dynamodb(self, partition_key, sort_key=None):
+    def _get_lock_from_dynamodb(self, partition_key, sort_key):
         """
-        Loads the lock from the database - or returns None if not available. 
+        Loads the lock from the database - or returns None if not available.
 
         :rtype: BaseDynamoDBLock
         """
         logger.debug('Getting the lock from dynamodb for: %s, %s', partition_key, sort_key)
-        result = self.dynamodb_client.get_item(
-            TableName=self.table_name,
+        result = self.dynamodb_table.get_item(
             Key={
-                self.partition_key_name: {'S': partition_key},
-                self.sort_key_name: {'S': sort_key}
+                self.partition_key_name: partition_key,
+                self.sort_key_name: sort_key
             },
             ConsistentRead=True
         )
@@ -397,12 +464,11 @@ class DynamoDBLockClient:
     def _add_new_lock_to_dynamodb(self, lock):
         """
         Adds a new lock into the database - while checking that it does not exist already.
-         
+
         :param DynamoDBLock lock: The lock instance that needs to be added to the database.
         """
         logger.debug('Adding a new lock: %s', str(lock))
-        self.dynamodb_client.put_item(
-            TableName=self.table_name,
+        self.dynamodb_table.put_item(
             Item=self._get_item_from_lock(lock),
             ConditionExpression='NOT(attribute_exists(#pk) AND attribute_exists(#sk))',
             ExpressionAttributeNames={
@@ -414,14 +480,13 @@ class DynamoDBLockClient:
 
     def _overwrite_existing_lock_in_dynamodb(self, lock, record_version_number):
         """
-        Overwrites an existing lock in the database - while checking that the version has not changed. 
+        Overwrites an existing lock in the database - while checking that the version has not changed.
 
         :param DynamoDBLock lock: The new lock instance that needs to overwrite the old one in the database.
         :param str record_version_number: The version-number for the old lock instance in the database.
         """
         logger.debug('Overwriting existing-rvn: %s with new lock: %s', record_version_number,  str(lock))
-        self.dynamodb_client.put_item(
-            TableName=self.table_name,
+        self.dynamodb_table.put_item(
             Item=self._get_item_from_lock(lock),
             ConditionExpression='attribute_exists(#pk) AND attribute_exists(#sk) AND #rvn = :old_rvn',
             ExpressionAttributeNames={
@@ -457,20 +522,20 @@ class DynamoDBLockClient:
 
     def _get_item_from_lock(self, lock):
         """
-        Converts a BaseDynamoDBLock (or subclass) instance to a DynamoDB 'Item' dict 
+        Converts a BaseDynamoDBLock (or subclass) instance to a DynamoDB 'Item' dict
 
         :param BaseDynamoDBLock lock: The lock instance to be serialized.
-        :rtype: dict 
+        :rtype: dict
         """
         logger.debug('Get item from lock: %s', str(lock))
         item = lock.additional_attributes.copy()
         item.update({
-            self.partition_key_name: {'S': lock.partition_key},
-            self.sort_key_name: {'S': lock.sort_key},
-            'owner_name': {'S': lock.owner_name},
-            'lease_duration_in_seconds': {'N': lock.lease_duration_in_seconds},
-            'record_version_number': {'S': lock.record_version_number},
-            'expiry_time': { 'N': lock.expiry_time }
+            self.partition_key_name: lock.partition_key,
+            self.sort_key_name: lock.sort_key,
+            'owner_name': lock.owner_name,
+            'lease_duration_in_seconds': lock.lease_duration_in_seconds,
+            'record_version_number': lock.record_version_number,
+            'expiry_time': lock.expiry_time
         })
         return item
 
@@ -478,24 +543,34 @@ class DynamoDBLockClient:
     def _release_all_locks(self):
         """
         Iterates over all the locks and releases each one.
-        
-        It is highly recommended that the application never invoke this in production.
-        Instead, the application should keep track of all the threads that are actually
-        performing work "under" these locks, and have each of them abort and release the
-        respective lock.
         """
-        logger.debug('Releasing all locks')
-        for uid, lock in self._locks.items():
+        logger.info('Releasing all locks: %d', len(self._locks))
+        for uid, lock in self._locks.copy().items():
             self.release_lock(lock, best_effort=True)
+            # TODO: should we fire app-callback to indicate the force-release
+            # self._call_app_callback(lock, DynamoDBLockError.LOCK_STOLEN)
 
 
     def close(self, release_locks=False):
         """
         Shuts down the background thread - and releases all locks if so asked.
-        
+
+        By default, this method will NOT release all the locks - as releasing the locks while
+        the application is still making changes assuming that it has the lock can be dangerous.
+        As soon as a lock is released by this client, some other client may pick it up, and the
+        associated app may start processing the underlying business entity in parallel.
+
+        It is recommended that the application manage its shutdown-lifecycle such that all the
+        worker threads operating under these locks are first terminated (committed or rolled-back),
+        the corresponding locks released (one at a time - by each worker thread), and then the
+        lock_client.close() method is called. Alternatively, consider letting the process die
+        without releasing all the locks - they will be auto-released when their lease runs out
+        after a while.
+
         :param bool release_locks: if True, releases all the locks. Defaults to False.
         """
-        logger.debug('Shutting down')
+        if self._shutting_down: return
+        logger.info('Shutting down')
         self._shutting_down = True
         self._background_thread.join()
         if release_locks: self._release_all_locks()
@@ -503,7 +578,7 @@ class DynamoDBLockClient:
 
     def __str__(self):
         """
-        Returns a readble string representation of this instance. 
+        Returns a readble string representation of this instance.
         """
         return '%s::%s' % (self.__class__.__name__, self.__dict__)
 
@@ -512,7 +587,7 @@ class DynamoDBLockClient:
 class BaseDynamoDBLock:
     """
     Represents a distributed lock - as stored in DynamoDB.
-    
+
     Typically used within the code to represent a lock held by some other lock-client.
     """
 
@@ -540,7 +615,7 @@ class BaseDynamoDBLock:
         self.lease_duration_in_seconds = lease_duration_in_seconds
         self.record_version_number = record_version_number
         self.expiry_time = expiry_time
-        self.additional_attributes = additional_attributes
+        self.additional_attributes = additional_attributes or {}
         # additional properties
         self.unique_identifier = quote(partition_key) + '|' + quote(sort_key)
         self.lease_duration = datetime.timedelta(seconds=lease_duration_in_seconds)
@@ -548,7 +623,7 @@ class BaseDynamoDBLock:
 
     def __str__(self):
         """
-        Returns a readble string representation of this instance. 
+        Returns a readble string representation of this instance.
         """
         return '%s::%s' % (self.__class__.__name__, self.__dict__)
 
@@ -578,8 +653,8 @@ class DynamoDBLock(BaseDynamoDBLock):
         :param str record_version_number: Changes with every heartbeat - the "liveness" indicator
         :param float expiry_time: Epoch timestamp in seconds after which DynamoDB will auto-delete the record
         :param dict additional_attributes: Arbitrary application metadata to be stored with the lock
-        
-        :param Callable app_callback: Callback function that can be used to notify the app of lock entering 
+
+        :param Callable app_callback: Callback function that can be used to notify the app of lock entering
                 the danger period, or an unexpected release
         :param DynamoDBLockClient lock_client: The client that "owns" this lock
         """
@@ -600,7 +675,7 @@ class DynamoDBLock(BaseDynamoDBLock):
 
     def __enter__(self):
         """
-        No-op - returns itself 
+        No-op - returns itself
         """
         logger.debug('Entering: %s', self.unique_identifier)
         return self
