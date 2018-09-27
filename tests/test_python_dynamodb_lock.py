@@ -6,12 +6,13 @@
 
 import unittest
 from unittest import mock
+import sys
+import logging
+logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+
 
 from python_dynamodb_lock.python_dynamodb_lock import *
 
-import logging
-import sys
-logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
 class TestDynamoDBLockClient(unittest.TestCase):
     """Tests for `python_dynamodb_lock` package."""
@@ -23,14 +24,14 @@ class TestDynamoDBLockClient(unittest.TestCase):
         self.lock_client = DynamoDBLockClient(
             self.ddb_resource,
             heartbeat_period=datetime.timedelta(milliseconds=100),
-            safe_period=datetime.timedelta(milliseconds=500),
+            safe_period=datetime.timedelta(milliseconds=600),
             lease_duration=datetime.timedelta(milliseconds=1000),
             expiry_period=datetime.timedelta(milliseconds=5000),
             heartbeat_tps=1000,
         )
         # switch the table reference; easier than patching etc.
         self.ddb_table = mock.MagicMock(name='ddb_table')
-        self.lock_client.dynamodb_table = self.ddb_table
+        self.lock_client._dynamodb_table = self.ddb_table
 
     def tearDown(self):
         """Tear down test fixtures, if any."""
@@ -74,6 +75,8 @@ class TestDynamoDBLockClient(unittest.TestCase):
             'Error': { 'Code': 'ConditionalCheckFailedException' }
         }, 'update_item')
         time.sleep(200/1000)
+        self.ddb_table.update_item.side_effect = None
+        self.assertEqual(len(self.lock_client._locks), 0)
         self.assertEqual(len(self.app_callbacks), 1)
         (code, lock) = self.app_callbacks.pop(0)
         self.assertEqual(code, DynamoDBLockError.LOCK_STOLEN)
@@ -87,6 +90,7 @@ class TestDynamoDBLockClient(unittest.TestCase):
             'Error': { 'Code': 'SomeOtherDynamoDBError' }
         }, 'update_item')
         time.sleep(200/1000)
+        self.ddb_table.update_item.side_effect = None
         self.assertEqual(len(self.app_callbacks), 0) # ignore other DDB Errors
 
 
@@ -96,6 +100,7 @@ class TestDynamoDBLockClient(unittest.TestCase):
         time.sleep(200/1000)
         self.ddb_table.update_item.side_effect = RuntimeError('TestError')
         time.sleep(200/1000)
+        self.ddb_table.update_item.side_effect = None
         self.assertEqual(len(self.app_callbacks), 0) # ignore other Runtime Errors
 
 
@@ -103,7 +108,8 @@ class TestDynamoDBLockClient(unittest.TestCase):
         self.ddb_table.update_item = mock.MagicMock('update_item')
         self.ddb_table.update_item.side_effect = RuntimeError('TestError')
         self.lock_client.acquire_lock('key', app_callback=self.app_callback)
-        time.sleep(600/1000)
+        time.sleep(700/1000)
+        self.ddb_table.update_item.side_effect = None
         self.assertTrue(len(self.app_callbacks) >= 1)
         (code, lock) = self.app_callbacks.pop(0)
         self.assertEqual(code, DynamoDBLockError.LOCK_IN_DANGER)
@@ -142,7 +148,7 @@ class TestDynamoDBLockClient(unittest.TestCase):
                     'lock_key': 'key',
                     'sort_key': '-',
                     'owner_name': 'owner',
-                    'lease_duration_in_seconds': 0.3,
+                    'lease_duration': 0.3,
                     'record_version_number': 'xyz',
                     'expiry_time': 100,
                 }
@@ -159,19 +165,16 @@ class TestDynamoDBLockClient(unittest.TestCase):
 
     def test_acquire_lock_after_lease_expires(self):
         self.ddb_table.get_item = mock.MagicMock('get_item')
-        # keep returning the same value
-        def get_item_stub(*args, **kwargs):
-            return {
-                'Item': {
-                    'lock_key': 'key',
-                    'sort_key': '-',
-                    'owner_name': 'owner',
-                    'lease_duration_in_seconds': 0.3,
-                    'record_version_number': 'xyz',
-                    'expiry_time': 100,
-                }
+        self.ddb_table.get_item.side_effect = lambda **kwargs: {
+            'Item': {
+                'lock_key': 'key',
+                'sort_key': '-',
+                'owner_name': 'owner',
+                'lease_duration': 0.3,
+                'record_version_number': 'xyz',
+                'expiry_time': 100,
             }
-        self.ddb_table.get_item.side_effect = get_item_stub
+        }
         start_time = time.time()
         lock = self.lock_client.acquire_lock('key', retry_period=datetime.timedelta(milliseconds=100))
         end_time = time.time()
@@ -181,19 +184,16 @@ class TestDynamoDBLockClient(unittest.TestCase):
 
     def test_acquire_lock_retry_timeout(self):
         self.ddb_table.get_item = mock.MagicMock('get_item')
-        # keep returning the same value
-        def get_item_stub(*args, **kwargs):
-            return {
-                'Item': {
-                    'lock_key': 'key',
-                    'sort_key': '-',
-                    'owner_name': 'owner',
-                    'lease_duration_in_seconds': 0.5,
-                    'record_version_number': 'xyz',
-                    'expiry_time': 100,
-                }
+        self.ddb_table.get_item.side_effect = lambda **kwargs: {
+            'Item': {
+                'lock_key': 'key',
+                'sort_key': '-',
+                'owner_name': 'owner',
+                'lease_duration': 0.6,
+                'record_version_number': 'xyz',
+                'expiry_time': 100,
             }
-        self.ddb_table.get_item.side_effect = get_item_stub
+        }
         start_time = time.time()
         try:
             self.lock_client.acquire_lock(
@@ -211,10 +211,7 @@ class TestDynamoDBLockClient(unittest.TestCase):
         # test the get-none, put-error, retry, get-none, put-success case
         self.ddb_table.get_item = mock.MagicMock('get_item')
         self.ddb_table.put_item = mock.MagicMock('put_item')
-        self.ddb_table.get_item.side_effect = [
-            {},
-            {}
-        ]
+        self.ddb_table.get_item.side_effect = lambda **kwargs: {}
         self.ddb_table.put_item.side_effect = [
             ClientError({
                 'Error': { 'Code': 'ConditionalCheckFailedException' }
@@ -231,7 +228,7 @@ class TestDynamoDBLockClient(unittest.TestCase):
         # test the get-none, put-error
         self.ddb_table.get_item = mock.MagicMock('get_item')
         self.ddb_table.put_item = mock.MagicMock('put_item')
-        self.ddb_table.get_item.return_value = {}
+        self.ddb_table.get_item.side_effect = lambda **kwargs: {}
         self.ddb_table.put_item.side_effect = ClientError({
             'Error': { 'Code': 'SomeOtherDynamoDBError' }
         }, 'put_item')
@@ -245,7 +242,7 @@ class TestDynamoDBLockClient(unittest.TestCase):
         # test the get-none, put-error
         self.ddb_table.get_item = mock.MagicMock('get_item')
         self.ddb_table.put_item = mock.MagicMock('put_item')
-        self.ddb_table.get_item.return_value = {}
+        self.ddb_table.get_item.side_effect = lambda **kwargs: {}
         self.ddb_table.put_item.side_effect = RuntimeError('TestError')
         try:
             self.lock_client.acquire_lock('key', retry_period=datetime.timedelta(milliseconds=100))
@@ -265,12 +262,10 @@ class TestDynamoDBLockClient(unittest.TestCase):
 
 
     def test_release_lock_not_owned(self):
+        other_lock_client = DynamoDBLockClient(self.ddb_table)
+        other_lock = other_lock_client.acquire_lock('key')
         try:
-            other_lock_client = DynamoDBLockClient(self.ddb_table)
-            self.lock_client.release_lock(
-                DynamoDBLock('key', '-', 'owner', 5, 'rec-ver-num', 10, {}, None, other_lock_client),
-                best_effort=False
-            )
+            self.lock_client.release_lock(other_lock, best_effort=False)
             self.fail('Expected an error')
         except DynamoDBLockError as e:
             self.assertEqual(e.code, DynamoDBLockError.LOCK_NOT_OWNED)
@@ -322,9 +317,8 @@ class TestDynamoDBLockClient(unittest.TestCase):
 
     def test_best_effort_release_lock_not_owned(self):
         other_lock_client = DynamoDBLockClient(self.ddb_table)
-        self.lock_client.release_lock(
-            DynamoDBLock('key', '-', 'owner', 5, 'rec-ver-num', 10, {}, None, other_lock_client)
-        )
+        other_lock = other_lock_client.acquire_lock('key')
+        self.lock_client.release_lock(other_lock)
 
 
     def test_best_effort_release_lock_after_stolen(self):
@@ -365,7 +359,7 @@ class TestDynamoDBLockClient(unittest.TestCase):
         self.assertEqual(item[self.lock_client.partition_key_name], 'p')
         self.assertEqual(item[self.lock_client.sort_key_name], 's')
         self.assertEqual(item['owner_name'], 'o')
-        self.assertEqual(item['lease_duration_in_seconds'], 5)
+        self.assertEqual(item['lease_duration'], 5)
         self.assertEqual(item['record_version_number'], 'r')
         self.assertEqual(item['expiry_time'], 10)
         self.assertEqual(item['k'], 'v')
@@ -376,7 +370,7 @@ class TestDynamoDBLockClient(unittest.TestCase):
             self.lock_client.partition_key_name: 'p2',
             self.lock_client.sort_key_name: 's2',
             'owner_name': 'o2',
-            'lease_duration_in_seconds': 52,
+            'lease_duration': 52,
             'record_version_number': 'r2',
             'expiry_time': 102,
             'k2': 'v2'
@@ -385,7 +379,7 @@ class TestDynamoDBLockClient(unittest.TestCase):
         self.assertEqual(lock.partition_key, 'p2')
         self.assertEqual(lock.sort_key, 's2')
         self.assertEqual(lock.owner_name, 'o2')
-        self.assertEqual(lock.lease_duration_in_seconds, 52)
+        self.assertEqual(lock.lease_duration, 52)
         self.assertEqual(lock.record_version_number, 'r2')
         self.assertEqual(lock.expiry_time, 102)
         self.assertDictEqual(lock.additional_attributes, { 'k2': 'v2' })
@@ -407,4 +401,5 @@ class TestDynamoDBLockClient(unittest.TestCase):
         lock = self.lock_client.acquire_lock('key')
         self.lock_client.close(release_locks=True)
         self.assertFalse(lock.unique_identifier in self.lock_client._locks)
+
 

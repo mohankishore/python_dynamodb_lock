@@ -27,6 +27,7 @@ duration, the implementation should work just fine.
 from botocore.exceptions import ClientError
 from concurrent.futures import ThreadPoolExecutor
 import datetime
+from decimal import Decimal
 import logging
 import socket
 import time
@@ -53,12 +54,22 @@ class DynamoDBLockClient:
     _DEFAULT_EXPIRY_PERIOD = datetime.timedelta(hours=1)
     _DEFAULT_HEARTBEAT_TPS = 5
     _DEFAULT_APP_CALLBACK_THREADPOOL_SIZE = 5
+    # for optional create-table method
+    _DEFAULT_READ_CAPACITY = 5
+    _DEFAULT_WRITE_CAPACITY = 5
 
+    # to help make the sort-key optional
     _DEFAULT_SORT_KEY_VALUE = '-'
+
+    # DynamoDB "hard-coded" column names
+    _COL_OWNER_NAME = 'owner_name'
+    _COL_LEASE_DURATION = 'lease_duration'
+    _COL_RECORD_VERSION_NUMBER = 'record_version_number'
+    _COL_EXPIRY_TIME = 'expiry_time'
 
 
     def __init__(self,
-                 dynamodb,
+                 dynamodb_resource,
                  table_name=_DEFAULT_TABLE_NAME,
                  partition_key_name=_DEFAULT_PARTITION_KEY_NAME,
                  sort_key_name=_DEFAULT_SORT_KEY_NAME,
@@ -71,7 +82,7 @@ class DynamoDBLockClient:
                  app_callback_executor=None
                  ):
         """
-        :param boto3.ServiceResource dynamodb: mandatory argument
+        :param boto3.ServiceResource dynamodb_resource: mandatory argument
         :param str table_name: defaults to 'DynamoDBLockTable'
         :param str partition_key_name: defaults to 'lock_key'
         :param str sort_key_name: defaults to 'sort_key'
@@ -96,7 +107,7 @@ class DynamoDBLockClient:
                 maximum of 5 threads.
         """
         self.uuid = uuid.uuid4().hex
-        self.dynamodb = dynamodb
+        self.dynamodb_resource = dynamodb_resource
         self.table_name = table_name
         self.partition_key_name = partition_key_name
         self.sort_key_name = sort_key_name
@@ -113,7 +124,7 @@ class DynamoDBLockClient:
         # additional properties
         self._locks = {}
         self._shutting_down = False
-        self.dynamodb_table = dynamodb.Table(table_name)
+        self._dynamodb_table = dynamodb_resource.Table(table_name)
         # and, initialization
         self._start_background_thread()
         logger.info('Created: %s', str(self))
@@ -200,10 +211,10 @@ class DynamoDBLockClient:
 
                 old_record_version_number = lock.record_version_number
                 new_record_version_number = str(uuid.uuid4())
-                new_expiry_time = time.time() + self.expiry_period.total_seconds()
+                new_expiry_time = int(time.time() + self.expiry_period.total_seconds())
 
                 # first, try to update the database
-                self.dynamodb_table.update_item(
+                self._dynamodb_table.update_item(
                     Key={
                         self.partition_key_name: lock.partition_key,
                         self.sort_key_name: lock.sort_key
@@ -213,19 +224,20 @@ class DynamoDBLockClient:
                     ExpressionAttributeNames={
                         '#pk': self.partition_key_name,
                         '#sk': self.sort_key_name,
-                        '#rvn': 'record_version_number',
-                        '#et': 'expiry_time',
+                        '#rvn': self._COL_RECORD_VERSION_NUMBER,
+                        '#et': self._COL_EXPIRY_TIME,
                     },
                     ExpressionAttributeValues={
-                        ':old_rvn': {'S': old_record_version_number},
-                        ':new_rvn': {'S': new_record_version_number},
-                        ':new_et':  {'N': new_expiry_time}
+                        ':old_rvn': old_record_version_number,
+                        ':new_rvn': new_record_version_number,
+                        ':new_et':  new_expiry_time,
                     }
                 )
 
                 # if successful, update the in-memory lock representations
                 lock.record_version_number = new_record_version_number
                 lock.expiry_time = new_expiry_time
+                lock.last_updated_time = time.time()
                 logger.debug('Successfully sent the heartbeat: %s', lock.unique_identifier)
             except ClientError as e:
                 if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
@@ -243,9 +255,8 @@ class DynamoDBLockClient:
                 # Note: the lock might have been released locally by the conditional-exception above
                 if lock.unique_identifier not in self._locks: return
                 # if the lock is in danger, invoke the app-callback
-                last_update_time = lock.expiry_time - self.expiry_period.total_seconds()
-                is_lock_safe = time.time() < (last_update_time + self.safe_period.total_seconds())
-                if not is_lock_safe:
+                safe_period_end_time = lock.last_updated_time + self.safe_period.total_seconds()
+                if not time.time() < safe_period_end_time:
                     logger.warning('LockInDanger while sending heartbeat: %s', lock.unique_identifier)
                     # callback - the app should abort its processing, and release the lock
                     self._call_app_callback(lock, DynamoDBLockError.LOCK_IN_DANGER)
@@ -311,9 +322,9 @@ class DynamoDBLockClient:
             partition_key=partition_key,
             sort_key=sort_key,
             owner_name=self.owner_name,
-            lease_duration_in_seconds=self.lease_duration.total_seconds(),
+            lease_duration=self.lease_duration.total_seconds(),
             record_version_number=str( uuid.uuid4() ),
-            expiry_time=time.time() + self.expiry_period.total_seconds(),
+            expiry_time=int(time.time() + self.expiry_period.total_seconds()),
             additional_attributes=additional_attributes,
             app_callback=app_callback,
             lock_client=self,
@@ -330,7 +341,8 @@ class DynamoDBLockClient:
 
             try:
                 # need to bump up the expiry time - to account for the sleep between tries
-                new_lock.expiry_time = time.time() + self.expiry_period.total_seconds()
+                new_lock.last_updated_time = time.time()
+                new_lock.expiry_time = int(time.time() + self.expiry_period.total_seconds())
 
                 logger.debug('Checking the database for existing owner: %s', new_lock.unique_identifier)
                 existing_lock = self._get_lock_from_dynamodb(partition_key, sort_key)
@@ -359,7 +371,7 @@ class DynamoDBLockClient:
                         # if the record_version_number has not changed for more than lease_duration period,
                         # it basically means that the owner thread/process has died.
                         last_version_elapsed_time = time.time() - last_version_fetch_time
-                        if last_version_elapsed_time > existing_lock.lease_duration.total_seconds():
+                        if last_version_elapsed_time > existing_lock.lease_duration:
                             logger.warning('Existing lock\'s lease has expired: %s', str(existing_lock))
                             self._overwrite_existing_lock_in_dynamodb(new_lock, last_record_version_number)
                             logger.debug('Added to the DDB. Adding to in-memory map: %s', new_lock.unique_identifier)
@@ -380,7 +392,7 @@ class DynamoDBLockClient:
             next_loop_start_time = start_time + retry_count * retry_period.total_seconds()
             if next_loop_start_time > retry_timeout_time:
                 raise DynamoDBLockError(DynamoDBLockError.ACQUIRE_TIMEOUT, 'acquire_lock() timed out: ' + new_lock.unique_identifier)
-            elif curr_loop_end_time < next_loop_start_time:
+            elif next_loop_start_time > curr_loop_end_time:
                 logger.info('Sleeping before a retry: %s', new_lock.unique_identifier)
                 time.sleep(next_loop_start_time - curr_loop_end_time)
 
@@ -417,7 +429,7 @@ class DynamoDBLockClient:
                 del self._locks[lock.unique_identifier]
 
                 # then, remove it from the database
-                self.dynamodb_table.delete_item(
+                self._dynamodb_table.delete_item(
                     Key={
                         self.partition_key_name: lock.partition_key,
                         self.sort_key_name: lock.sort_key
@@ -426,10 +438,10 @@ class DynamoDBLockClient:
                     ExpressionAttributeNames={
                         '#pk': self.partition_key_name,
                         '#sk': self.sort_key_name,
-                        '#rvn': 'record_version_number',
+                        '#rvn': self._COL_RECORD_VERSION_NUMBER,
                     },
                     ExpressionAttributeValues={
-                        ':rvn': {'S': lock.record_version_number},
+                        ':rvn': lock.record_version_number,
                     }
                 )
 
@@ -456,7 +468,7 @@ class DynamoDBLockClient:
         :rtype: BaseDynamoDBLock
         """
         logger.debug('Getting the lock from dynamodb for: %s, %s', partition_key, sort_key)
-        result = self.dynamodb_table.get_item(
+        result = self._dynamodb_table.get_item(
             Key={
                 self.partition_key_name: partition_key,
                 self.sort_key_name: sort_key
@@ -476,7 +488,7 @@ class DynamoDBLockClient:
         :param DynamoDBLock lock: The lock instance that needs to be added to the database.
         """
         logger.debug('Adding a new lock: %s', str(lock))
-        self.dynamodb_table.put_item(
+        self._dynamodb_table.put_item(
             Item=self._get_item_from_lock(lock),
             ConditionExpression='NOT(attribute_exists(#pk) AND attribute_exists(#sk))',
             ExpressionAttributeNames={
@@ -494,16 +506,16 @@ class DynamoDBLockClient:
         :param str record_version_number: The version-number for the old lock instance in the database.
         """
         logger.debug('Overwriting existing-rvn: %s with new lock: %s', record_version_number,  str(lock))
-        self.dynamodb_table.put_item(
+        self._dynamodb_table.put_item(
             Item=self._get_item_from_lock(lock),
             ConditionExpression='attribute_exists(#pk) AND attribute_exists(#sk) AND #rvn = :old_rvn',
             ExpressionAttributeNames={
                 '#pk': self.partition_key_name,
                 '#sk': self.sort_key_name,
-                '#rvn': 'record_version_number',
+                '#rvn': self._COL_RECORD_VERSION_NUMBER,
             },
             ExpressionAttributeValues={
-                ':old_rvn': {'S': record_version_number},
+                ':old_rvn': record_version_number,
             }
         )
 
@@ -519,10 +531,10 @@ class DynamoDBLockClient:
         lock = BaseDynamoDBLock(
             partition_key=item.pop(self.partition_key_name),
             sort_key=item.pop(self.sort_key_name),
-            owner_name=item.pop('owner_name'),
-            lease_duration_in_seconds=item.pop('lease_duration_in_seconds'),
-            record_version_number=item.pop('record_version_number'),
-            expiry_time=item.pop('expiry_time'),
+            owner_name=item.pop(self._COL_OWNER_NAME),
+            lease_duration=float(item.pop(self._COL_LEASE_DURATION)),
+            record_version_number=item.pop(self._COL_RECORD_VERSION_NUMBER),
+            expiry_time=int(item.pop(self._COL_EXPIRY_TIME)),
             additional_attributes=item
         )
         return lock
@@ -540,10 +552,10 @@ class DynamoDBLockClient:
         item.update({
             self.partition_key_name: lock.partition_key,
             self.sort_key_name: lock.sort_key,
-            'owner_name': lock.owner_name,
-            'lease_duration_in_seconds': lock.lease_duration_in_seconds,
-            'record_version_number': lock.record_version_number,
-            'expiry_time': lock.expiry_time
+            self._COL_OWNER_NAME: lock.owner_name,
+            self._COL_LEASE_DURATION: Decimal.from_float(lock.lease_duration),
+            self._COL_RECORD_VERSION_NUMBER: lock.record_version_number,
+            self._COL_EXPIRY_TIME: lock.expiry_time
         })
         return item
 
@@ -591,6 +603,80 @@ class DynamoDBLockClient:
         return '%s::%s' % (self.__class__.__name__, self.__dict__)
 
 
+    @classmethod
+    def create_dynamodb_table(cls,
+                              dynamodb_client,
+                              table_name=_DEFAULT_TABLE_NAME,
+                              partition_key_name=_DEFAULT_PARTITION_KEY_NAME,
+                              sort_key_name=_DEFAULT_SORT_KEY_NAME,
+                              read_capacity=_DEFAULT_READ_CAPACITY,
+                              write_capacity=_DEFAULT_WRITE_CAPACITY):
+
+        """
+        Helper method to create the DynamoDB table
+        
+        :param boto3.DynamoDB.Client dynamodb_client: mandatory argument
+        :param str table_name: defaults to 'DynamoDBLockTable'
+        :param str partition_key_name: defaults to 'lock_key'
+        :param str sort_key_name: defaults to 'sort_key'
+        :param int read_capacity: the max TPS for strongly-consistent reads; defaults to 5
+        :param int write_capacity: the max TPS for write operations; defaults to 5
+        :return: 
+        """
+        logger.info("Creating the lock table: %s", table_name)
+        dynamodb_client.create_table(
+            TableName=table_name,
+            KeySchema=[
+                {
+                    'AttributeName': partition_key_name,
+                    'KeyType': 'HASH'
+                },
+                {
+                    'AttributeName': sort_key_name,
+                    'KeyType': 'RANGE'
+                },
+            ],
+            AttributeDefinitions=[
+                {
+                    'AttributeName': partition_key_name,
+                    'AttributeType': 'S'
+                },
+                {
+                    'AttributeName': sort_key_name,
+                    'AttributeType': 'S'
+                },
+            ],
+            ProvisionedThroughput={
+                'ReadCapacityUnits': read_capacity,
+                'WriteCapacityUnits': write_capacity
+            },
+        )
+        cls._wait_for_table_to_be_active(dynamodb_client, table_name)
+
+        logger.info("Updating the table with time_to_live configuration")
+        dynamodb_client.update_time_to_live(
+            TableName=table_name,
+            TimeToLiveSpecification={
+                'Enabled': True,
+                'AttributeName': cls._COL_EXPIRY_TIME
+            }
+        )
+        cls._wait_for_table_to_be_active(dynamodb_client, table_name)
+
+
+    @classmethod
+    def _wait_for_table_to_be_active(cls, dynamodb_client, table_name):
+        logger.info("Waiting till the table becomes ACTIVE")
+        while True:
+            response = dynamodb_client.describe_table(TableName=table_name)
+            status = response.get('Table', {}).get('TableStatus', 'UNKNOWN')
+            logger.info("Table status: %s", status)
+            if status == 'ACTIVE':
+                break
+            else:
+                time.sleep(2)
+
+
 
 class BaseDynamoDBLock:
     """
@@ -603,7 +689,7 @@ class BaseDynamoDBLock:
                  partition_key,
                  sort_key,
                  owner_name,
-                 lease_duration_in_seconds,
+                 lease_duration,
                  record_version_number,
                  expiry_time,
                  additional_attributes
@@ -612,21 +698,20 @@ class BaseDynamoDBLock:
         :param str partition_key: The primary lock identifier
         :param str sort_key: If present, forms a "composite identifier" along with the partition_key
         :param str owner_name: The owner name - typically from the lock_client
-        :param float lease_duration_in_seconds: The lease duration - typically from the lock_client
-        :param str record_version_number: Changes with every heartbeat - the "liveness" indicator
-        :param float expiry_time: Epoch timestamp in seconds after which DynamoDB will auto-delete the record
+        :param float lease_duration: The lease duration in seconds - typically from the lock_client
+        :param str record_version_number: A "liveness" indicating GUID - changes with every heartbeat
+        :param int expiry_time: Epoch timestamp in seconds after which DynamoDB will auto-delete the record
         :param dict additional_attributes: Arbitrary application metadata to be stored with the lock
         """
         self.partition_key = partition_key
         self.sort_key = sort_key
         self.owner_name = owner_name
-        self.lease_duration_in_seconds = lease_duration_in_seconds
+        self.lease_duration = lease_duration
         self.record_version_number = record_version_number
         self.expiry_time = expiry_time
         self.additional_attributes = additional_attributes or {}
         # additional properties
         self.unique_identifier = quote(partition_key) + '|' + quote(sort_key)
-        self.lease_duration = datetime.timedelta(seconds=lease_duration_in_seconds)
 
 
     def __str__(self):
@@ -646,7 +731,7 @@ class DynamoDBLock(BaseDynamoDBLock):
                  partition_key,
                  sort_key,
                  owner_name,
-                 lease_duration_in_seconds,
+                 lease_duration,
                  record_version_number,
                  expiry_time,
                  additional_attributes,
@@ -657,9 +742,9 @@ class DynamoDBLock(BaseDynamoDBLock):
         :param str partition_key: The primary lock identifier
         :param str sort_key: If present, forms a "composite identifier" along with the partition_key
         :param str owner_name: The owner name - typically from the lock_client
-        :param float lease_duration_in_seconds: The lease duration - typically from the lock_client
+        :param float lease_duration: The lease duration - typically from the lock_client
         :param str record_version_number: Changes with every heartbeat - the "liveness" indicator
-        :param float expiry_time: Epoch timestamp in seconds after which DynamoDB will auto-delete the record
+        :param int expiry_time: Epoch timestamp in seconds after which DynamoDB will auto-delete the record
         :param dict additional_attributes: Arbitrary application metadata to be stored with the lock
 
         :param Callable app_callback: Callback function that can be used to notify the app of lock entering
@@ -670,7 +755,7 @@ class DynamoDBLock(BaseDynamoDBLock):
                                   partition_key,
                                   sort_key,
                                   owner_name,
-                                  lease_duration_in_seconds,
+                                  lease_duration,
                                   record_version_number,
                                   expiry_time,
                                   additional_attributes
@@ -678,6 +763,7 @@ class DynamoDBLock(BaseDynamoDBLock):
         self.app_callback = app_callback
         self.lock_client = lock_client
         # additional properties
+        self.last_updated_time = time.time()
         self.thread_lock = threading.RLock()
 
 
