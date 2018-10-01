@@ -27,7 +27,6 @@ class TestDynamoDBLockClient(unittest.TestCase):
             safe_period=datetime.timedelta(milliseconds=600),
             lease_duration=datetime.timedelta(milliseconds=1000),
             expiry_period=datetime.timedelta(milliseconds=5000),
-            heartbeat_tps=1000,
         )
         # switch the table reference; easier than patching etc.
         self.ddb_table = mock.MagicMock(name='ddb_table')
@@ -51,13 +50,20 @@ class TestDynamoDBLockClient(unittest.TestCase):
 
     # send_heartbeat tests
 
-    def test_background_thread(self):
-        background_thread = self.lock_client._background_thread
-        self.assertIsNotNone(background_thread)
-        self.assertTrue(background_thread.isDaemon())
-        self.assertTrue(background_thread.isAlive())
+    def test_background_threads(self):
+        heartbeat_sender = self.lock_client._heartbeat_sender_thread
+        self.assertIsNotNone(heartbeat_sender)
+        self.assertTrue(heartbeat_sender.isDaemon())
+        self.assertTrue(heartbeat_sender.isAlive())
+        heartbeat_checker = self.lock_client._heartbeat_checker_thread
+        self.assertIsNotNone(heartbeat_checker)
+        self.assertTrue(heartbeat_checker.isDaemon())
+        self.assertTrue(heartbeat_checker.isAlive())
+        # now, close the client
         self.lock_client.close()
-        self.assertFalse(background_thread.isAlive())
+        # and check that the threads are also shutdown
+        self.assertFalse(heartbeat_sender.isAlive())
+        self.assertFalse(heartbeat_checker.isAlive())
 
 
     def test_send_heartbeat_success(self):
@@ -104,13 +110,14 @@ class TestDynamoDBLockClient(unittest.TestCase):
         self.assertEqual(len(self.app_callbacks), 0) # ignore other Runtime Errors
 
 
+    # this tests the heartbeat_checker_thread and the app_callback_executor
     def test_send_heartbeat_in_danger(self):
         self.ddb_table.update_item = mock.MagicMock('update_item')
         self.ddb_table.update_item.side_effect = RuntimeError('TestError')
         self.lock_client.acquire_lock('key', app_callback=self.app_callback)
-        time.sleep(700/1000)
+        time.sleep(850/1000)
         self.ddb_table.update_item.side_effect = None
-        self.assertTrue(len(self.app_callbacks) >= 1)
+        self.assertTrue(len(self.app_callbacks) == 1)
         (code, lock) = self.app_callbacks.pop(0)
         self.assertEqual(code, DynamoDBLockError.LOCK_IN_DANGER)
 
@@ -156,9 +163,9 @@ class TestDynamoDBLockClient(unittest.TestCase):
             # second call, act as if its been deleted
             {}
         ]
-        start_time = time.time()
+        start_time = time.monotonic()
         lock = self.lock_client.acquire_lock('key', retry_period=datetime.timedelta(milliseconds=100))
-        end_time = time.time()
+        end_time = time.monotonic()
         self.assertIsNotNone(lock)
         self.assertTrue((end_time - start_time) * 1000 >= 100)
 
@@ -175,9 +182,9 @@ class TestDynamoDBLockClient(unittest.TestCase):
                 'expiry_time': 100,
             }
         }
-        start_time = time.time()
+        start_time = time.monotonic()
         lock = self.lock_client.acquire_lock('key', retry_period=datetime.timedelta(milliseconds=100))
-        end_time = time.time()
+        end_time = time.monotonic()
         self.assertIsNotNone(lock)
         self.assertTrue((end_time - start_time) * 1000 >= 300)
 
@@ -194,7 +201,7 @@ class TestDynamoDBLockClient(unittest.TestCase):
                 'expiry_time': 100,
             }
         }
-        start_time = time.time()
+        start_time = time.monotonic()
         try:
             self.lock_client.acquire_lock(
                 'key',
@@ -202,7 +209,7 @@ class TestDynamoDBLockClient(unittest.TestCase):
                 retry_timeout=datetime.timedelta(milliseconds=300))
             self.fail('Expected an error')
         except DynamoDBLockError as e:
-            end_time = time.time()
+            end_time = time.monotonic()
             self.assertEqual(e.code, DynamoDBLockError.ACQUIRE_TIMEOUT)
             self.assertTrue((end_time - start_time) * 1000 >= 200)
             # at 220ms, it would error out, instead of sleeping for another 100ms
@@ -218,9 +225,9 @@ class TestDynamoDBLockClient(unittest.TestCase):
             }, 'put_item'),
             {}
         ]
-        start_time = time.time()
+        start_time = time.monotonic()
         lock = self.lock_client.acquire_lock('key', retry_period=datetime.timedelta(milliseconds=100))
-        end_time = time.time()
+        end_time = time.monotonic()
         self.assertIsNotNone(lock)
         self.assertTrue((end_time - start_time) * 1000 >= 100)
 
@@ -356,8 +363,8 @@ class TestDynamoDBLockClient(unittest.TestCase):
     def test_lock_to_item(self):
         lock = BaseDynamoDBLock('p', 's', 'o', 5, 'r', 10, { 'k': 'v'})
         item = self.lock_client._get_item_from_lock(lock) or {}
-        self.assertEqual(item[self.lock_client.partition_key_name], 'p')
-        self.assertEqual(item[self.lock_client.sort_key_name], 's')
+        self.assertEqual(item[self.lock_client._partition_key_name], 'p')
+        self.assertEqual(item[self.lock_client._sort_key_name], 's')
         self.assertEqual(item['owner_name'], 'o')
         self.assertEqual(item['lease_duration'], 5)
         self.assertEqual(item['record_version_number'], 'r')
@@ -367,8 +374,8 @@ class TestDynamoDBLockClient(unittest.TestCase):
 
     def test_item_to_lock(self):
         item = {
-            self.lock_client.partition_key_name: 'p2',
-            self.lock_client.sort_key_name: 's2',
+            self.lock_client._partition_key_name: 'p2',
+            self.lock_client._sort_key_name: 's2',
             'owner_name': 'o2',
             'lease_duration': 52,
             'record_version_number': 'r2',
@@ -402,4 +409,17 @@ class TestDynamoDBLockClient(unittest.TestCase):
         self.lock_client.close(release_locks=True)
         self.assertFalse(lock.unique_identifier in self.lock_client._locks)
 
+
+    # context-manager methods
+
+    def test_lock_with_enter_exit(self):
+        self.ddb_table.get_item = mock.MagicMock('get_item')
+        self.ddb_table.put_item = mock.MagicMock('put_item')
+        self.ddb_table.delete_item = mock.MagicMock('delete_item')
+        with self.lock_client.acquire_lock('key') as lock:
+            self.assertIsNotNone(lock)
+            self.ddb_table.get_item.assert_called()
+            self.ddb_table.put_item.assert_called()
+            print('Lock: %s' % (str(lock)))
+        self.ddb_table.delete_item.assert_called()
 
