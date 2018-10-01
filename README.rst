@@ -17,11 +17,12 @@ Python DynamoDB Lock
 
 
 This is a general purpose distributed locking library built on top of DynamoDB. It is heavily
-"inspired" by the java-based AmazonDynamoDBLockClient (https://github.com/awslabs/dynamodb-lock-client)
+"inspired" by the java-based `AmazonDynamoDBLockClient <https://github.com/awslabs/dynamodb-lock-client>`_
 library, and supports both coarse-grained and fine-grained locking.
 
 * Free software: Apache Software License 2.0
-* Documentation: https://python-dynamodb-lock.readthedocs.io.
+* Documentation: https://python-dynamodb-lock.readthedocs.io
+* Source Code: https://github.com/mohankishore/python_dynamodb_lock
 
 
 Features
