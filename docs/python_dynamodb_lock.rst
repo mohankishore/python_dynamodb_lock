@@ -8,7 +8,7 @@ python\_dynamodb\_lock package
 
 
 python\_dynamodb\_lock module
-----------------------------------------------------
+-----------------------------
 
 .. automodule:: python_dynamodb_lock.python_dynamodb_lock
     :members:
