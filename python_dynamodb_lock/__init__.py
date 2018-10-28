@@ -4,5 +4,5 @@
 
 __author__ = """Mohan Kishore"""
 __email__ = 'mohankishore@yahoo.com'
-__version__ = '0.9.0'
+__version__ = '0.9.1'
 __copyright__ = 'Copyright (C) 2018 Mohan Kishore'
