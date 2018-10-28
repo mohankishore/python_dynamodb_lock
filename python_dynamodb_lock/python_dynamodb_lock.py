@@ -137,7 +137,7 @@ class DynamoDBLockClient:
 
         The method has a while loop that wakes up on a periodic basis (as defined by the _heartbeat_period)
         and invokes the _send_heartbeat() method on each lock. It spreads the heartbeat-calls evenly over
-        the heartbeat window - to minimize the DynamoDB write throughput requirements. 
+        the heartbeat window - to minimize the DynamoDB write throughput requirements.
         """
         while not self._shutting_down:
             logger.info('Starting a send_heartbeat loop')
@@ -222,7 +222,7 @@ class DynamoDBLockClient:
                     ExpressionAttributeValues={
                         ':old_rvn': old_record_version_number,
                         ':new_rvn': new_record_version_number,
-                        ':new_et':  new_expiry_time,
+                        ':new_et': new_expiry_time,
                     }
                 )
 
@@ -292,7 +292,7 @@ class DynamoDBLockClient:
 
         As this method is called on a background thread, it uses the app_callback to let the
         (lock requestor) app know when there are significant events in the lock lifecycle.
-        
+
         1) LOCK_IN_DANGER
             When the heartbeat for a given lock has failed multiple times, and it is
             now in danger of going past its lease-duration without a successful heartbeat - at which
@@ -459,7 +459,10 @@ class DynamoDBLockClient:
                             return new_lock
             except ClientError as e:
                 if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
-                    logger.info('Someone else beat us to it - just log-it, sleep and retry: %s', new_lock.unique_identifier)
+                    logger.info(
+                        'Someone else beat us to it - just log-it, sleep and retry: %s',
+                        new_lock.unique_identifier
+                    )
                 else:
                     raise DynamoDBLockError(DynamoDBLockError.UNKNOWN, str(e))
             except Exception as e:
@@ -470,7 +473,10 @@ class DynamoDBLockClient:
             curr_loop_end_time = time.monotonic()
             next_loop_start_time = start_time + retry_count * retry_period.total_seconds()
             if next_loop_start_time > retry_timeout_time:
-                raise DynamoDBLockError(DynamoDBLockError.ACQUIRE_TIMEOUT, 'acquire_lock() timed out: ' + new_lock.unique_identifier)
+                raise DynamoDBLockError(
+                    DynamoDBLockError.ACQUIRE_TIMEOUT,
+                    'acquire_lock() timed out: ' + new_lock.unique_identifier
+                )
             elif next_loop_start_time > curr_loop_end_time:
                 logger.info('Sleeping before a retry: %s', new_lock.unique_identifier)
                 time.sleep(next_loop_start_time - curr_loop_end_time)
@@ -592,7 +598,7 @@ class DynamoDBLockClient:
         :param DynamoDBLock lock: The new lock instance that needs to overwrite the old one in the database.
         :param str record_version_number: The version-number for the old lock instance in the database.
         """
-        logger.debug('Overwriting existing-rvn: %s with new lock: %s', record_version_number,  str(lock))
+        logger.debug('Overwriting existing-rvn: %s with new lock: %s', record_version_number, str(lock))
         self._dynamodb_table.put_item(
             Item=self._get_item_from_lock(lock),
             ConditionExpression='attribute_exists(#pk) AND attribute_exists(#sk) AND #rvn = :old_rvn',
@@ -686,7 +692,7 @@ class DynamoDBLockClient:
 
     def __str__(self):
         """
-        Returns a readble string representation of this instance.
+        Returns a readable string representation of this instance.
         """
         return '%s::%s' % (self.__class__.__name__, self.__dict__)
 
@@ -703,7 +709,7 @@ class DynamoDBLockClient:
 
         """
         Helper method to create the DynamoDB table
-        
+
         :param boto3.DynamoDB.Client dynamodb_client: mandatory argument
         :param str table_name: defaults to 'DynamoDBLockTable'
         :param str partition_key_name: defaults to 'lock_key'
@@ -711,7 +717,6 @@ class DynamoDBLockClient:
         :param str ttl_attribute_name: defaults to 'expiry_time'
         :param int read_capacity: the max TPS for strongly-consistent reads; defaults to 5
         :param int write_capacity: the max TPS for write operations; defaults to 5
-        :return: 
         """
         logger.info("Creating the lock table: %s", table_name)
         dynamodb_client.create_table(
@@ -806,7 +811,7 @@ class BaseDynamoDBLock:
 
     def __str__(self):
         """
-        Returns a readble string representation of this instance.
+        Returns a readable string representation of this instance.
         """
         return '%s::%s' % (self.__class__.__name__, self.__dict__)
 
@@ -918,5 +923,7 @@ class DynamoDBLockError(Exception):
 
 
     def __str__(self):
+        """
+        Returns a readable string representation of this instance.
+        """
         return "%s: %s - %s" % (self.__class__.__name__, self.code, self.message)
-
