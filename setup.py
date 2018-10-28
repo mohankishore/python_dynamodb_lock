@@ -24,7 +24,7 @@ setup(
     author="Mohan Kishore",
     author_email='mohankishore@yahoo.com',
     classifiers=[
-        'Development Status :: 2 - Pre-Alpha',
+        'Development Status :: 4 - Beta',
         'Intended Audience :: Developers',
         'License :: OSI Approved :: Apache Software License',
         'Natural Language :: English',
