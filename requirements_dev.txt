@@ -8,4 +8,4 @@ coverage==4.5.1
 Sphinx==1.8.1
 twine==1.12.1
 sphinx_rtd_theme==0.4.2
-pytest==3.9.3
+pytest==4.3.1
