@@ -348,6 +348,7 @@ class DynamoDBLockClient:
                      retry_timeout=None,
                      additional_attributes=None,
                      app_callback=None,
+                     raise_context_exception=False,
                      ):
         """
         Acquires a distributed DynaomDBLock for the given key(s).
@@ -385,6 +386,7 @@ class DynamoDBLockClient:
         :param dict additional_attributes: Arbitrary application metadata to be stored with the lock
         :param Callable app_callback: Callback function that can be used to notify the app of lock entering
                 the danger period, or an unexpected release
+        :param bool raise_context_exception: Allow exception in the context to be raised
         :rtype: DynamoDBLock
         :return: A distributed lock instance
         """
@@ -405,6 +407,7 @@ class DynamoDBLockClient:
             additional_attributes=additional_attributes,
             app_callback=app_callback,
             lock_client=self,
+            raise_context_exception=raise_context_exception,
         )
 
         start_time = time.monotonic()
@@ -838,6 +841,7 @@ class DynamoDBLock(BaseDynamoDBLock):
                  additional_attributes,
                  app_callback,
                  lock_client,
+                 raise_context_exception,
                  ):
         """
         :param str partition_key: The primary lock identifier
@@ -851,6 +855,7 @@ class DynamoDBLock(BaseDynamoDBLock):
         :param Callable app_callback: Callback function that can be used to notify the app of lock entering
                 the danger period, or an unexpected release
         :param DynamoDBLockClient lock_client: The client that "owns" this lock
+        :param bool raise_context_exception: Allow exception in the context to be raised
         """
         BaseDynamoDBLock.__init__(self,
                                   partition_key,
@@ -863,6 +868,7 @@ class DynamoDBLock(BaseDynamoDBLock):
                                   )
         self.app_callback = app_callback
         self.lock_client = lock_client
+        self.raise_context_exception = raise_context_exception
         # additional properties
         self.last_updated_time = time.monotonic()
         self.thread_lock = threading.RLock()
@@ -883,7 +889,8 @@ class DynamoDBLock(BaseDynamoDBLock):
         """
         logger.debug('Exiting: %s', self.unique_identifier)
         self.release(best_effort=True)
-        return True
+        if not self.raise_context_exception:
+            return True
 
 
     def release(self, best_effort=True):
