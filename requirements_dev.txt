@@ -6,6 +6,6 @@ flake8==3.6.0
 tox==3.9.0
 coverage==4.5.1
 Sphinx==1.8.1
-twine==1.12.1
+twine==1.13.0
 sphinx_rtd_theme==0.4.2
 pytest==4.5.0
