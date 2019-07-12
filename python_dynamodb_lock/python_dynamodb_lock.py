@@ -448,9 +448,8 @@ class DynamoDBLockClient:
                                      last_record_version_number)
                         # if the record_version_number has not changed for more than _lease_duration period,
                         # it basically means that the owner thread/process has died.
-                        last_version_elapsed_time = time.monotonic() - last_version_fetch_time
-                        if last_version_elapsed_time > existing_lock.lease_duration:
-                            logger.warning('Existing lock\'s lease has expired: %s', str(existing_lock))
+                        if existing_lock.expiry_time < time.time():
+                            logger.warning('Existing lock\'s lease has expired: %s (%s)', str(existing_lock), time.time())
                             self._overwrite_existing_lock_in_dynamodb(new_lock, last_record_version_number)
                             logger.debug('Added to the DDB. Adding to in-memory map: %s', new_lock.unique_identifier)
                             new_lock.status = DynamoDBLock.LOCKED
