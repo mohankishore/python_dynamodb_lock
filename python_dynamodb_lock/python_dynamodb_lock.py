@@ -391,8 +391,8 @@ class DynamoDBLockClient:
         logger.info('Trying to acquire lock for: %s, %s', partition_key, sort_key)
 
         # plug in default values as needed
-        if not retry_period: retry_period = self._heartbeat_period
-        if not retry_timeout: retry_timeout = self._lease_duration + self._heartbeat_period
+        if retry_period is None: retry_period = self._heartbeat_period
+        if retry_timeout is None: retry_timeout = self._lease_duration + self._heartbeat_period
 
         # create the "new" lock that needs to be acquired
         new_lock = DynamoDBLock(
