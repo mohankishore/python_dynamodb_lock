@@ -806,7 +806,7 @@ class BaseDynamoDBLock:
         self.expiry_time = expiry_time
         self.additional_attributes = additional_attributes or {}
         # additional properties
-        self.unique_identifier = quote(partition_key) + '|' + quote(sort_key)
+        self.unique_identifier = quote(partition_key) + '|' + quote('%s' % sort_key)
 
 
     def __str__(self):
